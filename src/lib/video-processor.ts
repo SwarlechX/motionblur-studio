@@ -1,14 +1,5 @@
 /**
  * Video Processor — WebCodecs API tabanlı
- *
- * Pipeline:
- * 1. HTMLVideoElement: dosya → seek ile frame-by-frame extraction
- * 2. Canvas: frame rendering + motion blur uygulama
- * 3. VideoEncoder: processed frames → encoded VideoChunks
- * 4. webm-muxer / mp4-muxer: chunks → output file
- *
- * seek-based yaklaşım: real-time playback gerekmez,
- * her frame'e deterministik olarak erişir.
  */
 
 import {
@@ -19,7 +10,6 @@ import {
   type ProgressCallback,
 } from './motion-blur';
 
-// Dinamik import yerine statik — tree-shaking için
 import { Muxer as Mp4Muxer, ArrayBufferTarget as Mp4ArrayBufferTarget } from 'mp4-muxer';
 import { Muxer as WebMMuxer, ArrayBufferTarget as WebMArrayBufferTarget } from 'webm-muxer';
 
@@ -41,9 +31,6 @@ export interface VideoMetadata {
   frameCount: number;
 }
 
-/**
- * WebCodecs destek kontrolü
- */
 export function isWebCodecsSupported(): boolean {
   if (typeof window === 'undefined') return false;
   return (
@@ -53,9 +40,6 @@ export function isWebCodecsSupported(): boolean {
   );
 }
 
-/**
- * Video dosyasından metadata çıkar
- */
 export async function getVideoMetadata(file: File): Promise<VideoMetadata> {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
@@ -70,7 +54,7 @@ export async function getVideoMetadata(file: File): Promise<VideoMetadata> {
         width: video.videoWidth,
         height: video.videoHeight,
         duration: video.duration,
-        fps: 30, // Browser API fps vermiyor, varsayılan
+        fps: 30,
         frameCount: Math.round(video.duration * 30),
       };
       cleanup();
@@ -86,9 +70,6 @@ export async function getVideoMetadata(file: File): Promise<VideoMetadata> {
   });
 }
 
-/**
- * Thumbnail üret
- */
 export async function generateThumbnail(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
@@ -134,38 +115,37 @@ interface EncoderSetup {
   mimeType: string;
 }
 
+// Çeşitli H.264 ve VP9 codec seviyeleri — birinin çalışması garantilenir
+const CODEC_CANDIDATES = [
+  { codec: 'avc1.42001E', isMP4: true, mimeType: 'video/mp4', mp4Codec: 'avc' as const }, // H.264 Baseline 3.0
+  { codec: 'avc1.42E01F', isMP4: true, mimeType: 'video/mp4', mp4Codec: 'avc' as const }, // H.264 Baseline 3.1
+  { codec: 'avc1.4D401F', isMP4: true, mimeType: 'video/mp4', mp4Codec: 'avc' as const }, // H.264 Main 3.1
+  { codec: 'avc1.640028', isMP4: true, mimeType: 'video/mp4', mp4Codec: 'avc' as const }, // H.264 High 4.0
+  { codec: 'vp09.00.10.08', isMP4: false, mimeType: 'video/webm', mp4Codec: null }, // VP9
+  { codec: 'vp8', isMP4: false, mimeType: 'video/webm', mp4Codec: null }, // VP8 son çare
+];
+
 async function setupEncoder(
   width: number,
   height: number,
   fps: number,
   bitrate: number
 ): Promise<EncoderSetup> {
-  // Codec preference: H.264 (geniş destek) > VP9 (kalite)
-  const codecCandidates = [
-    {
-      codec: 'avc1.42E01F', // H.264 Baseline 3.0
-      isMP4: true,
-      mimeType: 'video/mp4',
-      mp4Codec: 'avc' as const,
-    },
-    {
-      codec: 'vp09.00.10.08', // VP9
-      isMP4: false,
-      mimeType: 'video/webm',
-      mp4Codec: null,
-    },
-  ];
+  // Genişlik/yükseklik çift sayı olmalı (H.264 gereksinimi)
+  const w = width % 2 === 0 ? width : width - 1;
+  const h = height % 2 === 0 ? height : height - 1;
 
-  for (const candidate of codecCandidates) {
+  for (const candidate of CODEC_CANDIDATES) {
     try {
+      // latencyMode kullanmadan config kontrolü — maksimum uyumluluk
       const support = await VideoEncoder.isConfigSupported({
         codec: candidate.codec,
-        width,
-        height,
+        width: w,
+        height: h,
         bitrate,
         framerate: fps,
-        latencyMode: 'quality',
       });
+
       if (!support.supported) continue;
 
       let target: any;
@@ -177,8 +157,8 @@ async function setupEncoder(
           target: target,
           video: {
             codec: candidate.mp4Codec,
-            width,
-            height,
+            width: w,
+            height: h,
           },
           fastStart: 'in-memory',
         });
@@ -187,9 +167,9 @@ async function setupEncoder(
         muxer = new WebMMuxer({
           target: target,
           video: {
-            codec: 'V_VP9',
-            width,
-            height,
+            codec: candidate.codec === 'vp8' ? 'V_VP8' : 'V_VP9',
+            width: w,
+            height: h,
           },
         });
       }
@@ -203,27 +183,31 @@ async function setupEncoder(
         },
       });
 
+      // Configure sade — latencyMode yok
       encoder.configure({
         codec: candidate.codec,
-        width,
-        height,
+        width: w,
+        height: h,
         bitrate,
         framerate: fps,
-        latencyMode: 'quality',
       });
+
+      // Configure başarılı mı kontrol et
+      if (encoder.state !== 'configured') {
+        encoder.close();
+        continue;
+      }
 
       return { encoder, muxer, target, mimeType: candidate.mimeType };
     } catch (e) {
+      console.warn(`Codec ${candidate.codec} failed:`, e);
       continue;
     }
   }
 
-  throw new Error('Hiçbir codec desteklenmiyor. Lütfen modern bir tarayıcı kullanın (Chrome/Edge/Safari).');
+  throw new Error('Hiçbir codec desteklenmiyor. Lütfen Chrome 94+ veya Edge 94+ deneyin.');
 }
 
-/**
- * Seek-to-frame helper: video.currentTime ayarlar, seeked bekler
- */
 function seekTo(video: HTMLVideoElement, time: number): Promise<void> {
   return new Promise((resolve, reject) => {
     const onSeeked = () => {
@@ -242,9 +226,6 @@ function seekTo(video: HTMLVideoElement, time: number): Promise<void> {
   });
 }
 
-/**
- * Ana işleme fonksiyonu
- */
 export async function processVideoWithMotionBlur(
   file: File,
   settings: MotionBlurSettings,
@@ -260,13 +241,11 @@ export async function processVideoWithMotionBlur(
   const startTime = performance.now();
   const metadata = await getVideoMetadata(file);
 
-  // Quality scaling
   const scale = settings.quality;
   const outWidth = Math.max(2, Math.round(metadata.width * scale));
   const outHeight = Math.max(2, Math.round(metadata.height * scale));
   const fps = metadata.fps;
   const frameCount = metadata.frameCount;
-  // Bitrate: kalite + boyut dengesi (0.1 bits/pixel/frame)
   const bitrate = Math.min(12_000_000, Math.max(500_000, Math.round(outWidth * outHeight * fps * 0.1)));
 
   onProgress({
@@ -279,14 +258,12 @@ export async function processVideoWithMotionBlur(
 
   const { encoder, muxer, target, mimeType } = await setupEncoder(outWidth, outHeight, fps, bitrate);
 
-  // Canvas
   const canvas = document.createElement('canvas');
   canvas.width = outWidth;
   canvas.height = outHeight;
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) throw new Error('Canvas context alınamadı');
 
-  // Video element
   const video = document.createElement('video');
   video.src = URL.createObjectURL(file);
   video.muted = true;
@@ -300,7 +277,7 @@ export async function processVideoWithMotionBlur(
 
   const frameHistory = new FrameHistory(settings.samples);
   let processedCount = 0;
-  const frameDuration = 1 / fps; // seconds
+  const frameDuration = 1 / fps;
 
   onProgress({
     phase: 'processing',
@@ -310,27 +287,27 @@ export async function processVideoWithMotionBlur(
     message: 'Frame işleme başladı...',
   });
 
-  // Her frame'i sırayla seek+process
   for (let i = 0; i < frameCount; i++) {
     if (signal?.aborted) {
       throw new Error('İşleme iptal edildi');
     }
 
+    // Encoder hata varsa dur
+    if (encoder.state === 'closed') {
+      throw new Error('Encoder kapandı. Codec uyumsuz olabilir.');
+    }
+
     const seekTime = Math.min(metadata.duration - 0.001, i * frameDuration);
     await seekTo(video, seekTime);
 
-    // Frame'i canvas'a çiz
     ctx.drawImage(video, 0, 0, outWidth, outHeight);
     const currentImageData = ctx.getImageData(0, 0, outWidth, outHeight);
 
-    // Motion blur uygula
     const blurred = applyMotionBlur(currentImageData, frameHistory.getHistory(), settings);
     ctx.putImageData(blurred, 0, 0);
 
-    // History'ye ekle (orijinal frame'i — bozulmuş değil)
     frameHistory.add(currentImageData);
 
-    // Encode
     const timestampMicros = Math.round(i * frameDuration * 1_000_000);
     const durationMicros = Math.round(frameDuration * 1_000_000);
 
@@ -342,7 +319,6 @@ export async function processVideoWithMotionBlur(
     encoder.encode(frame, { keyFrame: i % 30 === 0 });
     frame.close();
 
-    // Encoder bellek yönetimi: sıra dolarsa bekle
     if (encoder.encodeQueueSize > 10) {
       await new Promise((r) => setTimeout(r, 1));
       if (encoder.encodeQueueSize > 20) {
@@ -352,7 +328,6 @@ export async function processVideoWithMotionBlur(
 
     processedCount = i + 1;
 
-    // Progress (her 3 frame'de bir raporla — performans için)
     if (i % 3 === 0 || i === frameCount - 1) {
       onProgress({
         phase: 'processing',
@@ -362,12 +337,10 @@ export async function processVideoWithMotionBlur(
         message: `Frame işleniyor: ${processedCount}/${frameCount}`,
       });
 
-      // UI thread nefes alsın
       await new Promise((r) => setTimeout(r, 0));
     }
   }
 
-  // Son flush
   onProgress({
     phase: 'encoding',
     currentFrame: processedCount,
@@ -379,7 +352,6 @@ export async function processVideoWithMotionBlur(
   await encoder.flush();
   await encoder.close();
 
-  // Mux finalize
   muxer.finalize();
 
   if (!target.buffer) {
@@ -389,7 +361,6 @@ export async function processVideoWithMotionBlur(
   const blob = new Blob([target.buffer], { type: mimeType });
   const durationMs = performance.now() - startTime;
 
-  // Cleanup
   URL.revokeObjectURL(video.src);
   frameHistory.clear();
 
@@ -412,9 +383,6 @@ export async function processVideoWithMotionBlur(
   };
 }
 
-/**
- * Format bytes → human readable
- */
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -422,9 +390,6 @@ export function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
-/**
- * Format duration → human readable
- */
 export function formatDuration(ms: number): string {
   if (ms < 1000) return `${Math.round(ms)}ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
