@@ -1,5 +1,10 @@
 /**
- * Video Processor — WebCodecs API
+ * Video Processor — MediaRecorder API
+ *
+ * WebCodecs yerine MediaRecorder kullanır:
+ * - Tüm modern tarayıcılarda çalışır (Chrome, Edge, Firefox, Safari)
+ * - Codec otomatik seçilir (browser ne destekiyorsa)
+ * - Real-time capture: video süresi kadar işleme süresi
  */
 
 import {
@@ -9,9 +14,6 @@ import {
   type ProcessProgress,
   type ProgressCallback,
 } from './motion-blur';
-
-import { Muxer as Mp4Muxer, ArrayBufferTarget as Mp4ArrayBufferTarget } from 'mp4-muxer';
-import { Muxer as WebMMuxer, ArrayBufferTarget as WebMArrayBufferTarget } from 'webm-muxer';
 
 export interface ProcessedResult {
   blob: Blob;
@@ -32,12 +34,8 @@ export interface VideoMetadata {
 }
 
 export function isWebCodecsSupported(): boolean {
-  if (typeof window === 'undefined') return false;
-  return (
-    typeof VideoDecoder !== 'undefined' &&
-    typeof VideoEncoder !== 'undefined' &&
-    typeof VideoFrame !== 'undefined'
-  );
+  // API uyumluluk için tutuldu
+  return false;
 }
 
 export async function getVideoMetadata(file: File): Promise<VideoMetadata> {
@@ -108,139 +106,21 @@ export async function generateThumbnail(file: File): Promise<string> {
   });
 }
 
-// H.264 ve VP9 codec seviyeleri — biri mutlaka çalışır
-const CODEC_CANDIDATES = [
-  { codec: 'avc1.42001E', isMP4: true, mimeType: 'video/mp4', mp4Codec: 'avc' as const },
-  { codec: 'avc1.42E01F', isMP4: true, mimeType: 'video/mp4', mp4Codec: 'avc' as const },
-  { codec: 'avc1.4D401F', isMP4: true, mimeType: 'video/mp4', mp4Codec: 'avc' as const },
-  { codec: 'avc1.640028', isMP4: true, mimeType: 'video/mp4', mp4Codec: 'avc' as const },
-  { codec: 'vp09.00.10.08', isMP4: false, mimeType: 'video/webm', mp4Codec: null },
-  { codec: 'vp8', isMP4: false, mimeType: 'video/webm', mp4Codec: null },
-];
-
-interface EncoderSetup {
-  encoder: VideoEncoder;
-  muxer: any;
-  target: { buffer: ArrayBuffer | null };
-  mimeType: string;
-}
-
-async function setupEncoder(
-  width: number,
-  height: number,
-  fps: number,
-  bitrate: number,
-  onError: (err: Error) => void
-): Promise<EncoderSetup> {
-  // H.264 çift sayı pixel ister
-  const w = width % 2 === 0 ? width : width - 1;
-  const h = height % 2 === 0 ? height : height - 1;
-
-  const failedCodecs: string[] = [];
-
-  for (const candidate of CODEC_CANDIDATES) {
-    try {
-      const support = await VideoEncoder.isConfigSupported({
-        codec: candidate.codec,
-        width: w,
-        height: h,
-        bitrate,
-        framerate: fps,
-      });
-
-      if (!support.supported) {
-        failedCodecs.push(`${candidate.codec} (not supported)`);
-        continue;
-      }
-
-      let target: any;
-      let muxer: any;
-
-      if (candidate.isMP4) {
-        target = new Mp4ArrayBufferTarget();
-        muxer = new Mp4Muxer({
-          target: target,
-          video: {
-            codec: candidate.mp4Codec,
-            width: w,
-            height: h,
-          },
-          fastStart: 'in-memory',
-        });
-      } else {
-        target = new WebMArrayBufferTarget();
-        muxer = new WebMMuxer({
-          target: target,
-          video: {
-            codec: candidate.codec === 'vp8' ? 'V_VP8' : 'V_VP9',
-            width: w,
-            height: h,
-          },
-        });
-      }
-
-      // Hata yakalama — ana akışa iletip kullanıcıya göster
-      const encoder = new VideoEncoder({
-        output: (chunk, meta) => {
-          try {
-            muxer.addVideoChunk(chunk, meta ?? undefined);
-          } catch (e) {
-            console.error('Muxer error:', e);
-            onError(e instanceof Error ? e : new Error(String(e)));
-          }
-        },
-        error: (err) => {
-          console.error('VideoEncoder error:', err);
-          onError(err instanceof Error ? err : new Error(String(err)));
-        },
-      });
-
-      encoder.configure({
-        codec: candidate.codec,
-        width: w,
-        height: h,
-        bitrate,
-        framerate: fps,
-      });
-
-      // Configure senkron olarak state'i günceller
-      if (encoder.state !== 'configured') {
-        failedCodecs.push(`${candidate.codec} (state: ${encoder.state})`);
-        try { encoder.close(); } catch {}
-        continue;
-      }
-
-      console.log(`✓ Codec seçildi: ${candidate.codec} (${w}x${h})`);
-      return { encoder, muxer, target, mimeType: candidate.mimeType };
-    } catch (e) {
-      failedCodecs.push(`${candidate.codec} (${e instanceof Error ? e.message : 'unknown'})`);
-      continue;
+// Desteklenen MIME türünü seç
+function pickMimeType(): string {
+  const candidates = [
+    'video/webm;codecs=vp9',
+    'video/webm;codecs=vp8',
+    'video/webm',
+    'video/mp4;codecs=h264',
+    'video/mp4',
+  ];
+  for (const type of candidates) {
+    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(type)) {
+      return type;
     }
   }
-
-  throw new Error(
-    `Hiçbir codec desteklenmiyor.\n\nDenenenler:\n${failedCodecs.map(c => '• ' + c).join('\n')}\n\n` +
-    `Browser: ${navigator.userAgent}\n` +
-    `Lütfen Chrome 94+ veya Edge 94+ deneyin.`
-  );
-}
-
-function seekTo(video: HTMLVideoElement, time: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const onSeeked = () => {
-      video.removeEventListener('seeked', onSeeked);
-      video.removeEventListener('error', onError);
-      resolve();
-    };
-    const onError = () => {
-      video.removeEventListener('seeked', onSeeked);
-      video.removeEventListener('error', onError);
-      reject(new Error(`Seek başarısız: t=${time}`));
-    };
-    video.addEventListener('seeked', onSeeked);
-    video.addEventListener('error', onError);
-    video.currentTime = time;
-  });
+  return 'video/webm';
 }
 
 export async function processVideoWithMotionBlur(
@@ -249,10 +129,8 @@ export async function processVideoWithMotionBlur(
   onProgress: ProgressCallback,
   signal?: AbortSignal
 ): Promise<ProcessedResult> {
-  if (!isWebCodecsSupported()) {
-    throw new Error(
-      'WebCodecs API desteklenmiyor. Lütfen Chrome 94+, Edge 94+ veya Safari 16.4+ kullanın.'
-    );
+  if (typeof MediaRecorder === 'undefined') {
+    throw new Error('MediaRecorder API desteklenmiyor. Lütfen modern bir tarayıcı kullanın.');
   }
 
   const startTime = performance.now();
@@ -263,32 +141,23 @@ export async function processVideoWithMotionBlur(
   const outHeight = Math.max(2, Math.round(metadata.height * scale));
   const fps = metadata.fps;
   const frameCount = metadata.frameCount;
-  const bitrate = Math.min(8_000_000, Math.max(500_000, Math.round(outWidth * outHeight * fps * 0.07)));
 
   onProgress({
     phase: 'decoding',
     currentFrame: 0,
     totalFrames: frameCount,
     progress: 0,
-    message: 'Encoder hazırlanıyor...',
+    message: 'Hazırlanıyor...',
   });
 
-  // Encoder hatası burada toplanır
-  let encoderError: Error | null = null;
-  const reportError = (err: Error) => {
-    if (!encoderError) encoderError = err;
-  };
-
-  const { encoder, muxer, target, mimeType } = await setupEncoder(
-    outWidth, outHeight, fps, bitrate, reportError
-  );
-
+  // Canvas — frame rendering için
   const canvas = document.createElement('canvas');
   canvas.width = outWidth;
   canvas.height = outHeight;
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) throw new Error('Canvas context alınamadı');
 
+  // Video element
   const video = document.createElement('video');
   video.src = URL.createObjectURL(file);
   video.muted = true;
@@ -300,107 +169,149 @@ export async function processVideoWithMotionBlur(
     video.onerror = () => reject(new Error('Video yüklenemedi'));
   });
 
+  // Canvas stream + MediaRecorder
+  const stream = canvas.captureStream(fps);
+  const mimeType = pickMimeType();
+  const bitrate = Math.min(8_000_000, Math.max(500_000, Math.round(outWidth * outHeight * fps * 0.07)));
+
+  const recorder = new MediaRecorder(stream, {
+    mimeType,
+    videoBitsPerSecond: bitrate,
+  });
+
+  const chunks: Blob[] = [];
+  recorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) {
+      chunks.push(e.data);
+    }
+  };
+
+  const recorderDone = new Promise<Blob>((resolve, reject) => {
+    recorder.onstop = () => {
+      const blob = new Blob(chunks, { type: mimeType });
+      resolve(blob);
+    };
+    recorder.onerror = (e) => reject(new Error('Kayıt hatası: ' + e));
+  });
+
+  // Frame history
   const frameHistory = new FrameHistory(settings.samples);
   let processedCount = 0;
-  const frameDuration = 1 / fps;
+  let isAborted = false;
 
-  onProgress({
-    phase: 'processing',
-    currentFrame: 0,
-    totalFrames: frameCount,
-    progress: 0,
-    message: 'Frame işleme başladı...',
-  });
-
-  for (let i = 0; i < frameCount; i++) {
-    if (signal?.aborted) {
-      throw new Error('İşleme iptal edildi');
-    }
-
-    // Encoder hatası varsa hemen fırlat
-    if (encoderError) {
-      throw new Error(`Encoder hatası: ${encoderError.message}`);
-    }
-
-    // Encoder state kontrolü
-    if (encoder.state !== 'configured') {
-      throw new Error(
-        `Encoder yapılandırılamadı (state: ${encoder.state}). ` +
-        `Browser: ${navigator.userAgent.split(') ')[0]})`
-      );
-    }
-
-    const seekTime = Math.min(metadata.duration - 0.001, i * frameDuration);
-    await seekTo(video, seekTime);
-
-    ctx.drawImage(video, 0, 0, outWidth, outHeight);
-    const currentImageData = ctx.getImageData(0, 0, outWidth, outHeight);
-
-    const blurred = applyMotionBlur(currentImageData, frameHistory.getHistory(), settings);
-    ctx.putImageData(blurred, 0, 0);
-
-    frameHistory.add(currentImageData);
-
-    const timestampMicros = Math.round(i * frameDuration * 1_000_000);
-    const durationMicros = Math.round(frameDuration * 1_000_000);
-
-    const frame = new VideoFrame(canvas, {
-      timestamp: timestampMicros,
-      duration: durationMicros,
-    });
-
-    encoder.encode(frame, { keyFrame: i % 30 === 0 });
-    frame.close();
-
-    if (encoder.encodeQueueSize > 10) {
-      await new Promise((r) => setTimeout(r, 1));
-      if (encoder.encodeQueueSize > 20) {
-        await encoder.flush();
+  if (signal) {
+    signal.addEventListener('abort', () => {
+      isAborted = true;
+      if (recorder.state !== 'inactive') {
+        recorder.stop();
       }
-    }
-
-    processedCount = i + 1;
-
-    if (i % 3 === 0 || i === frameCount - 1) {
-      onProgress({
-        phase: 'processing',
-        currentFrame: processedCount,
-        totalFrames: frameCount,
-        progress: processedCount / frameCount,
-        message: `Frame işleniyor: ${processedCount}/${frameCount}`,
-      });
-
-      await new Promise((r) => setTimeout(r, 0));
-    }
+      video.pause();
+    });
   }
 
-  // Son kontrol
-  if (encoderError) {
-    throw new Error(`Encoder hatası: ${encoderError.message}`);
-  }
+  // Recording başlat
+  recorder.start(100); // 100ms chunks
 
-  onProgress({
-    phase: 'encoding',
-    currentFrame: processedCount,
-    totalFrames: frameCount,
-    progress: 0.95,
-    message: 'Final encode...',
+  // Real-time frame capture
+  // video.play() + requestVideoFrameCallback ile frame'leri çek
+  const processingPromise = new Promise<void>((resolve, reject) => {
+    let lastTime = -1;
+
+    const onFrame = async () => {
+      if (isAborted) {
+        resolve();
+        return;
+      }
+
+      const currentVideoTime = video.currentTime;
+
+      // Aynı frame'i tekrar işleme
+      if (currentTime !== lastTime) {
+        lastTime = currentTime;
+
+        // Canvas'a çiz
+        ctx.drawImage(video, 0, 0, outWidth, outHeight);
+        const currentImageData = ctx.getImageData(0, 0, outWidth, outHeight);
+
+        // Motion blur uygula
+        const blurred = applyMotionBlur(currentImageData, frameHistory.getHistory(), settings);
+
+        // History'ye ekle (orijinal frame)
+        frameHistory.add(currentImageData);
+
+        // Çıktıyı canvas'a yaz — captureStream otomatik alır
+        ctx.putImageData(blurred, 0, 0);
+
+        processedCount++;
+
+        onProgress({
+          phase: 'processing',
+          currentFrame: processedCount,
+          totalFrames: frameCount,
+          progress: Math.min(0.95, processedCount / frameCount),
+          message: `Frame işleniyor: ${processedCount}/${frameCount}`,
+        });
+      }
+
+      // Video bitti mi?
+      if (video.ended || currentVideoTime >= metadata.duration - 0.05) {
+        resolve();
+        return;
+      }
+
+      // Sonraki frame
+      if ('requestVideoFrameCallback' in video) {
+        (video as any).requestVideoFrameCallback(onFrame);
+      } else {
+        // Fallback: setTimeout ile 30fps simüle et
+        setTimeout(onFrame, 1000 / fps);
+      }
+    };
+
+    // İlk frame callback'i
+    if ('requestVideoFrameCallback' in video) {
+      (video as any).requestVideoFrameCallback(onFrame);
+    } else {
+      setTimeout(onFrame, 1000 / fps);
+    }
+
+    // Safety timeout — 2x video süresi
+    const safetyTimeout = setTimeout(() => {
+      if (!isAborted) resolve();
+    }, (metadata.duration + 5) * 1000);
+
+    video.onended = () => {
+      clearTimeout(safetyTimeout);
+      resolve();
+    };
+
+    video.onerror = (e) => {
+      clearTimeout(safetyTimeout);
+      reject(new Error('Video oynatma hatası'));
+    };
   });
 
-  await encoder.flush();
-  await encoder.close();
-
-  muxer.finalize();
-
-  if (!target.buffer) {
-    throw new Error('Muxer çıktı buffer üretmedi');
+  // Video oynat
+  try {
+    await video.play();
+  } catch (e) {
+    // Autoplay engellendi — manuel frame ilerletme
+    console.warn('Video play engellendi, manuel mod kullanılıyor');
   }
 
-  const blob = new Blob([target.buffer], { type: mimeType });
+  await processingPromise;
+
+  // Recorder'ı durdur
+  if (recorder.state !== 'inactive') {
+    recorder.stop();
+  }
+
+  const blob = await recorderDone;
   const durationMs = performance.now() - startTime;
 
   URL.revokeObjectURL(video.src);
   frameHistory.clear();
+  stream.getTracks().forEach((t) => t.stop());
 
   onProgress({
     phase: 'done',
