@@ -1,5 +1,5 @@
 /**
- * Video Processor — WebCodecs API tabanlı
+ * Video Processor — WebCodecs API
  */
 
 import {
@@ -63,7 +63,7 @@ export async function getVideoMetadata(file: File): Promise<VideoMetadata> {
 
     video.onerror = () => {
       cleanup();
-      reject(new Error('Video metadata yüklenemedi. Format desteklenmiyor olabilir.'));
+      reject(new Error('Video metadata yüklenemedi.'));
     };
 
     video.src = url;
@@ -108,6 +108,16 @@ export async function generateThumbnail(file: File): Promise<string> {
   });
 }
 
+// H.264 ve VP9 codec seviyeleri — biri mutlaka çalışır
+const CODEC_CANDIDATES = [
+  { codec: 'avc1.42001E', isMP4: true, mimeType: 'video/mp4', mp4Codec: 'avc' as const },
+  { codec: 'avc1.42E01F', isMP4: true, mimeType: 'video/mp4', mp4Codec: 'avc' as const },
+  { codec: 'avc1.4D401F', isMP4: true, mimeType: 'video/mp4', mp4Codec: 'avc' as const },
+  { codec: 'avc1.640028', isMP4: true, mimeType: 'video/mp4', mp4Codec: 'avc' as const },
+  { codec: 'vp09.00.10.08', isMP4: false, mimeType: 'video/webm', mp4Codec: null },
+  { codec: 'vp8', isMP4: false, mimeType: 'video/webm', mp4Codec: null },
+];
+
 interface EncoderSetup {
   encoder: VideoEncoder;
   muxer: any;
@@ -115,29 +125,21 @@ interface EncoderSetup {
   mimeType: string;
 }
 
-// Çeşitli H.264 ve VP9 codec seviyeleri — birinin çalışması garantilenir
-const CODEC_CANDIDATES = [
-  { codec: 'avc1.42001E', isMP4: true, mimeType: 'video/mp4', mp4Codec: 'avc' as const }, // H.264 Baseline 3.0
-  { codec: 'avc1.42E01F', isMP4: true, mimeType: 'video/mp4', mp4Codec: 'avc' as const }, // H.264 Baseline 3.1
-  { codec: 'avc1.4D401F', isMP4: true, mimeType: 'video/mp4', mp4Codec: 'avc' as const }, // H.264 Main 3.1
-  { codec: 'avc1.640028', isMP4: true, mimeType: 'video/mp4', mp4Codec: 'avc' as const }, // H.264 High 4.0
-  { codec: 'vp09.00.10.08', isMP4: false, mimeType: 'video/webm', mp4Codec: null }, // VP9
-  { codec: 'vp8', isMP4: false, mimeType: 'video/webm', mp4Codec: null }, // VP8 son çare
-];
-
 async function setupEncoder(
   width: number,
   height: number,
   fps: number,
-  bitrate: number
+  bitrate: number,
+  onError: (err: Error) => void
 ): Promise<EncoderSetup> {
-  // Genişlik/yükseklik çift sayı olmalı (H.264 gereksinimi)
+  // H.264 çift sayı pixel ister
   const w = width % 2 === 0 ? width : width - 1;
   const h = height % 2 === 0 ? height : height - 1;
 
+  const failedCodecs: string[] = [];
+
   for (const candidate of CODEC_CANDIDATES) {
     try {
-      // latencyMode kullanmadan config kontrolü — maksimum uyumluluk
       const support = await VideoEncoder.isConfigSupported({
         codec: candidate.codec,
         width: w,
@@ -146,7 +148,10 @@ async function setupEncoder(
         framerate: fps,
       });
 
-      if (!support.supported) continue;
+      if (!support.supported) {
+        failedCodecs.push(`${candidate.codec} (not supported)`);
+        continue;
+      }
 
       let target: any;
       let muxer: any;
@@ -174,16 +179,22 @@ async function setupEncoder(
         });
       }
 
+      // Hata yakalama — ana akışa iletip kullanıcıya göster
       const encoder = new VideoEncoder({
         output: (chunk, meta) => {
-          muxer.addVideoChunk(chunk, meta ?? undefined);
+          try {
+            muxer.addVideoChunk(chunk, meta ?? undefined);
+          } catch (e) {
+            console.error('Muxer error:', e);
+            onError(e instanceof Error ? e : new Error(String(e)));
+          }
         },
         error: (err) => {
           console.error('VideoEncoder error:', err);
+          onError(err instanceof Error ? err : new Error(String(err)));
         },
       });
 
-      // Configure sade — latencyMode yok
       encoder.configure({
         codec: candidate.codec,
         width: w,
@@ -192,20 +203,26 @@ async function setupEncoder(
         framerate: fps,
       });
 
-      // Configure başarılı mı kontrol et
+      // Configure senkron olarak state'i günceller
       if (encoder.state !== 'configured') {
-        encoder.close();
+        failedCodecs.push(`${candidate.codec} (state: ${encoder.state})`);
+        try { encoder.close(); } catch {}
         continue;
       }
 
+      console.log(`✓ Codec seçildi: ${candidate.codec} (${w}x${h})`);
       return { encoder, muxer, target, mimeType: candidate.mimeType };
     } catch (e) {
-      console.warn(`Codec ${candidate.codec} failed:`, e);
+      failedCodecs.push(`${candidate.codec} (${e instanceof Error ? e.message : 'unknown'})`);
       continue;
     }
   }
 
-  throw new Error('Hiçbir codec desteklenmiyor. Lütfen Chrome 94+ veya Edge 94+ deneyin.');
+  throw new Error(
+    `Hiçbir codec desteklenmiyor.\n\nDenenenler:\n${failedCodecs.map(c => '• ' + c).join('\n')}\n\n` +
+    `Browser: ${navigator.userAgent}\n` +
+    `Lütfen Chrome 94+ veya Edge 94+ deneyin.`
+  );
 }
 
 function seekTo(video: HTMLVideoElement, time: number): Promise<void> {
@@ -246,7 +263,7 @@ export async function processVideoWithMotionBlur(
   const outHeight = Math.max(2, Math.round(metadata.height * scale));
   const fps = metadata.fps;
   const frameCount = metadata.frameCount;
-  const bitrate = Math.min(12_000_000, Math.max(500_000, Math.round(outWidth * outHeight * fps * 0.1)));
+  const bitrate = Math.min(8_000_000, Math.max(500_000, Math.round(outWidth * outHeight * fps * 0.07)));
 
   onProgress({
     phase: 'decoding',
@@ -256,7 +273,15 @@ export async function processVideoWithMotionBlur(
     message: 'Encoder hazırlanıyor...',
   });
 
-  const { encoder, muxer, target, mimeType } = await setupEncoder(outWidth, outHeight, fps, bitrate);
+  // Encoder hatası burada toplanır
+  let encoderError: Error | null = null;
+  const reportError = (err: Error) => {
+    if (!encoderError) encoderError = err;
+  };
+
+  const { encoder, muxer, target, mimeType } = await setupEncoder(
+    outWidth, outHeight, fps, bitrate, reportError
+  );
 
   const canvas = document.createElement('canvas');
   canvas.width = outWidth;
@@ -292,9 +317,17 @@ export async function processVideoWithMotionBlur(
       throw new Error('İşleme iptal edildi');
     }
 
-    // Encoder hata varsa dur
-    if (encoder.state === 'closed') {
-      throw new Error('Encoder kapandı. Codec uyumsuz olabilir.');
+    // Encoder hatası varsa hemen fırlat
+    if (encoderError) {
+      throw new Error(`Encoder hatası: ${encoderError.message}`);
+    }
+
+    // Encoder state kontrolü
+    if (encoder.state !== 'configured') {
+      throw new Error(
+        `Encoder yapılandırılamadı (state: ${encoder.state}). ` +
+        `Browser: ${navigator.userAgent.split(') ')[0]})`
+      );
     }
 
     const seekTime = Math.min(metadata.duration - 0.001, i * frameDuration);
@@ -339,6 +372,11 @@ export async function processVideoWithMotionBlur(
 
       await new Promise((r) => setTimeout(r, 0));
     }
+  }
+
+  // Son kontrol
+  if (encoderError) {
+    throw new Error(`Encoder hatası: ${encoderError.message}`);
   }
 
   onProgress({
